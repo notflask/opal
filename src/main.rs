@@ -1,5 +1,6 @@
 mod annot;
 mod capture;
+mod config;
 mod focus;
 mod geom;
 mod glass;
@@ -9,7 +10,7 @@ mod text;
 mod theme;
 mod toolbar;
 
-use std::{path::PathBuf, thread};
+use std::thread;
 
 use anyhow::{Result, bail};
 
@@ -42,6 +43,7 @@ fn main() -> Result<()> {
         }
     }
     let Some(mode) = mode else { bail!("{USAGE}") };
+    let cfg = config::Config::load();
 
     let t0 = std::time::Instant::now();
     let trace = |what: &str| {
@@ -89,6 +91,10 @@ fn main() -> Result<()> {
                 finish_on_release: no_edit,
                 hint_output: focused,
                 canvas_scale: scale,
+                tool: cfg.tool(),
+                color: cfg.color_index(),
+                width: cfg.draw.width.unwrap_or(annot::WIDTHS[1]).clamp(1.0, 24.0),
+                dim: cfg.dim.unwrap_or(0.42).clamp(0.0, 0.9),
             },
         )?;
         trace("overlay closed");
@@ -109,9 +115,10 @@ fn main() -> Result<()> {
         annot::draw_all(&mut image.as_mut(), &ctx, &items, fonts);
     }
     let png = output::encode_png(&image)?;
-    let dir = PathBuf::from(std::env::var("HOME")?).join("Screenshots");
-    let path = output::save(&png, &dir, &output::timestamp())?;
-    output::notify(&path);
+    let path = output::save(&png, &cfg.save_dir(), &output::timestamp())?;
+    if cfg.notify.unwrap_or(true) {
+        output::notify(&path);
+    }
     output::copy(&png)?;
     println!("{}", path.display());
     Ok(())

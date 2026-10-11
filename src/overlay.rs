@@ -73,6 +73,10 @@ pub struct Options {
     /// Where the hint is shown (focused output name).
     pub hint_output: Option<String>,
     pub canvas_scale: f32,
+    pub tool: Tool,
+    pub color: usize,
+    pub width: f32,
+    pub dim: f32,
 }
 
 struct Surf {
@@ -157,6 +161,7 @@ pub fn run(shots: Vec<Shot>, theme: Theme, fonts: Fonts, opts: Options) -> Resul
     let shm = Shm::bind(&globals, &qh).context("no wl_shm")?;
 
     let mut event_loop: EventLoop<Overlay> = EventLoop::try_new()?;
+    let (tool, color, width) = (opts.tool, opts.color, opts.width);
     let mut app = Overlay {
         conn: conn.clone(),
         qh: qh.clone(),
@@ -182,9 +187,9 @@ pub fn run(shots: Vec<Shot>, theme: Theme, fonts: Fonts, opts: Options) -> Resul
         icon: CursorIcon::Crosshair,
         drag: Drag::None,
         outcome: None,
-        tool: Tool::Arrow,
-        color: 0,
-        width: WIDTHS[1],
+        tool,
+        color,
+        width,
         history: History::default(),
         current: None,
         typing: false,
@@ -219,7 +224,7 @@ pub fn run(shots: Vec<Shot>, theme: Theme, fonts: Fonts, opts: Options) -> Resul
 
         let (pw, ph) = (shot.pixmap.width(), shot.pixmap.height());
         let mut dim = shot.pixmap.clone();
-        dim_pixmap(&mut dim, 0.42);
+        dim_pixmap(&mut dim, app.opts.dim);
         let scratch =
             (app.format != wl_shm::Format::Xbgr8888).then(|| Pixmap::new(pw, ph)).flatten();
         let surf = Surf {

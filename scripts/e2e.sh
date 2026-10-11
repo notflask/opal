@@ -65,6 +65,15 @@ repeat)
   sleep 0.5
   exec {IN[1]}>&-
   ;;
+noedit)
+  (HOME="$OUT/overlay" timeout 30 $OPAL region --no-edit >"$OUT/overlay.log" 2>&1 &)
+  coproc IN { $INJ; }
+  say() { echo "$1" >&"${IN[1]}"; sleep 0.2; }
+  sleep 1
+  say "m 2000 100"; say "down"; say "m 2400 400"; say "up"
+  sleep 1
+  exec {IN[1]}>&-
+  ;;
 drag)
   (HOME="$OUT/overlay" timeout 30 $OPAL region >"$OUT/overlay.log" 2>&1 &)
   coproc IN { $INJ; }
