@@ -29,6 +29,9 @@ USAGE: opal <region|output|all> [--no-edit]
   --no-edit  skip the editor, copy+save immediately";
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some(output::SERVE_CLIPBOARD) {
+        return output::serve_clipboard();
+    }
     let mut mode = None;
     let mut no_edit = false;
     for a in std::env::args().skip(1) {

@@ -83,12 +83,33 @@ pub fn save(png: &[u8], dir: &Path, stamp: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Serves the clipboard from a forked background process (like `wl-copy`).
+/// Hand the PNG to a detached copy of ourselves that keeps serving the
+/// clipboard after we exit (Wayland clipboards live only as long as their
+/// owner, like `wl-copy` which forks for the same reason).
 pub fn copy(png: &[u8]) -> Result<()> {
+    use std::{io::Write, process::Stdio};
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg(SERVE_CLIPBOARD)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    child.stdin.take().context("no stdin")?.write_all(png)?;
+    Ok(())
+}
+
+pub const SERVE_CLIPBOARD: &str = "--serve-clipboard";
+
+/// Body of the detached child: read a PNG from stdin and own the clipboard
+/// until something else replaces it.
+pub fn serve_clipboard() -> Result<()> {
+    use std::io::Read;
     use wl_clipboard_rs::copy::{MimeType, Options, Source};
+    let mut png = Vec::new();
+    std::io::stdin().read_to_end(&mut png)?;
     let mut opts = Options::new();
-    opts.foreground(false);
-    opts.copy(Source::Bytes(png.to_vec().into()), MimeType::Specific("image/png".into()))?;
+    opts.foreground(true);
+    opts.copy(Source::Bytes(png.into()), MimeType::Specific("image/png".into()))?;
     Ok(())
 }
 
