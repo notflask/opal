@@ -79,7 +79,6 @@ flashlight = false         # start with the flashlight on
 flashlight_radius = 200
 flashlight_dim = 0.75
 flashlight_pixel = 8       # edge of the light circle is made of squares this big (px); 1 = fine
-live_step = 0.5            # --live: zoom_factor change per wheel notch
 "##;
 
 #[derive(Clone, Debug)]
@@ -169,7 +168,6 @@ pub struct Zoom {
     pub flashlight_radius: f32,
     pub flashlight_dim: f32,
     pub flashlight_pixel: f32,
-    pub live_step: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -284,7 +282,6 @@ impl Config {
                 flashlight_radius: 200.0,
                 flashlight_dim: 0.75,
                 flashlight_pixel: 8.0,
-                live_step: 0.5,
             },
         }
     }
@@ -413,7 +410,7 @@ impl Config {
         if let Some(s) = section(t, "zoom", w) {
             check_keys(
                 s,
-                &["min", "max", "scroll_speed", "drag_friction", "scale_friction", "smooth", "filter", "nearest_from", "flashlight", "flashlight_radius", "flashlight_dim", "flashlight_pixel", "live_step"],
+                &["min", "max", "scroll_speed", "drag_friction", "scale_friction", "smooth", "filter", "nearest_from", "flashlight", "flashlight_radius", "flashlight_dim", "flashlight_pixel"],
                 "zoom.",
                 w,
             );
@@ -429,7 +426,6 @@ impl Config {
             take(s, "flashlight_radius", "zoom.", &mut z.flashlight_radius, w);
             take(s, "flashlight_dim", "zoom.", &mut z.flashlight_dim, w);
             take(s, "flashlight_pixel", "zoom.", &mut z.flashlight_pixel, w);
-            take(s, "live_step", "zoom.", &mut z.live_step, w);
             let mut filter = String::new();
             if take(s, "filter", "zoom.", &mut filter, w) {
                 match filter.as_str() {

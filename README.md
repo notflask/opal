@@ -10,8 +10,6 @@ opal all           every monitor, stitched by their layout
 opal <mode> --no-edit
                    skip the editor: output/all save at once, region saves on release
 opal zoom          freeze the screen, zoom and pan it (like tsoding/boomer)
-opal zoom --live [in|out|reset]
-                   Hyprland only: zoom the live screen with cursor:zoom_factor
 opal config        print the default config.toml
 opal config --check [FILE]
                    validate a config file, exit 1 on problems
@@ -57,10 +55,6 @@ rebound in `[keys]`. Text: Enter is a new line, Esc finishes it.
 Zooming moves the `wp_viewporter` source rectangle, so the compositor scales on the GPU and
 Opal does no pixel work (about 8 µs per frame). `filter = "nearest"` renders the visible part
 on the CPU instead, for crisp pixels (about 2 ms per frame and two extra screen-sized buffers).
-
-`opal zoom --live` leaves the screen live and drives Hyprland's own zoom: wheel or `=`/`-`
-zoom, `0` resets, Esc restores the old zoom. `opal zoom --live in|out|reset` does one step
-without any overlay, for key binds.
 
 ## Config
 
