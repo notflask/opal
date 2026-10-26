@@ -2,10 +2,12 @@
 name = "opal"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-cosmic-text = "0.19.0"
+fontdue = "0.9"
+libc = "0.2"
 png = "0.18.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -22,8 +24,9 @@ wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+panic = "abort"
 strip = true
 
 # pixel loops are unusably slow unoptimized

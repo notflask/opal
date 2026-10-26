@@ -1,24 +1,28 @@
-//! The frozen-screen overlay: one layer-shell surface per output showing the
-//! capture, dimmed, with a bright selection, annotations, a glass toolbar,
-//! and all input handling.
+//! The frozen-screen overlay. Per output: the capture itself as background
+//! (no copy), dim bars, a border, handles, the annotation layer and a few
+//! small panels, all as subsurfaces the compositor composes. Moving the
+//! selection only moves rectangles; nothing is redrawn pixel by pixel.
+
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
 
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
-    reexports::{
-        calloop::{EventLoop, LoopHandle},
-        calloop_wayland_source::WaylandSource,
-    },
-    compositor::{CompositorHandler, CompositorState, FrameCallbackData},
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region},
     delegate_dispatch2, delegate_registry,
     output::{OutputHandler, OutputState},
+    reexports::{
+        calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic},
+        calloop_wayland_source::WaylandSource,
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{
-            CursorIcon, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer,
-        },
+        pointer::{CursorIcon, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer},
     },
     shell::{
         WaylandSurface,
@@ -27,32 +31,34 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{Shm, ShmHandler},
+    subcompositor::SubcompositorState,
 };
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PixmapMut, Stroke, Transform};
+use tiny_skia::{Paint, Pixmap, PixmapMut, Transform};
 use wayland_client::{
     Connection, Dispatch, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
 };
-use wayland_protocols::wp::viewporter::client::{
-    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
-};
+use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 
 use crate::{
-    annot::{self, COLORS, Ctx, History, Item, Kind, Style, Tool, WIDTHS},
+    annot::{self, Ctx, History, Item, Kind, Style, Tool, WIDTHS},
     capture::Shot,
+    config::{Cmd, Config},
     geom::{Pt, Rect},
-    glass,
+    surface::{Anno, Env, IRect, Panel, Quad, Solids},
     text::Fonts,
-    theme::Theme,
-    toolbar::{self, Action, Toolbar},
+    theme::{Rgb, Theme},
+    ui::{self, Action, Canvas, Toolbar},
 };
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 /// How close (logical px) the pointer must be to a border to grab it.
 const GRAB: f32 = 8.0;
+const HANDLE_OUTER: i32 = 8;
+const HANDLE_INNER: i32 = 6;
 
 pub enum Outcome {
     Cancel,
@@ -73,15 +79,16 @@ pub struct Options {
     /// Where the hint is shown (focused output name).
     pub hint_output: Option<String>,
     pub canvas_scale: f32,
-    pub tool: Tool,
-    pub color: usize,
-    pub width: f32,
-    pub dim: f32,
 }
+
+/// Indexes into `Solids`.
+const SOLID_DIM: usize = 0;
+const SOLID_PRIMARY: usize = 1;
+const SOLID_SURFACE: usize = 2;
 
 struct Surf {
     layer: LayerSurface,
-    _viewport: WpViewport,
+    viewport: WpViewport,
     name: String,
     /// Index into `Overlay::shots`.
     shot: usize,
@@ -89,10 +96,21 @@ struct Surf {
     geo: Rect,
     /// Physical pixels per logical pixel.
     k: f32,
-    dim: Pixmap,
-    scratch: Option<Pixmap>,
-    pool: SlotPool,
+    dim: [Quad; 4],
+    anno: Anno,
+    /// Where the annotation layer was last drawn (global logical origin).
+    anno_origin: Option<(i32, i32)>,
+    /// What changed in the annotations since this output last drew them.
+    anno_dirty: Option<Rect>,
+    border: [Panel; 4],
+    handle_edge: Vec<Quad>,
+    handle_fill: Vec<Quad>,
+    toolbar: Panel,
+    label: Panel,
+    hint: Panel,
     configured: bool,
+    /// The background was attached.
+    drawn: bool,
     frame_pending: bool,
     dirty: bool,
 }
@@ -116,13 +134,14 @@ struct Overlay {
     qh: QueueHandle<Overlay>,
     loop_handle: LoopHandle<'static, Overlay>,
     registry: RegistryState,
-    compositor: CompositorState,
+    env: Env,
     outputs: OutputState,
     seats: SeatState,
     shm: Shm,
+    solids: Solids,
     surfs: Vec<Surf>,
     shots: Vec<Shot>,
-    format: wl_shm::Format,
+    cfg: Config,
     theme: Theme,
     fonts: Fonts,
     opts: Options,
@@ -145,35 +164,46 @@ struct Overlay {
     history: History,
     /// Shape being drawn, or text being typed.
     current: Option<Item>,
+    /// Where `current` was last drawn, to redraw exactly what changed.
+    cur_bounds: Option<Rect>,
     typing: bool,
     hover: Option<Action>,
 }
 
-pub fn run(shots: Vec<Shot>, theme: Theme, fonts: Fonts, opts: Options) -> Result<Finished> {
-    let conn = Connection::connect_to_env().context("no Wayland compositor")?;
-    let (globals, mut queue) = registry_queue_init(&conn)?;
+pub fn run(conn: &Connection, shots: Vec<Shot>, cfg: Config, theme: Theme, fonts: Fonts, opts: Options) -> Result<Finished> {
+    let (globals, mut queue) = registry_queue_init(conn)?;
     let qh = queue.handle();
 
-    let compositor = CompositorState::bind(&globals, &qh).context("no wl_compositor")?;
-    let layer_shell = LayerShell::bind(&globals, &qh).context("compositor lacks layer-shell")?;
+    let compositor = CompositorState::bind(&globals, &qh).context("the compositor lacks wl_compositor")?;
+    let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
+        .context("the compositor lacks wl_subcompositor")?;
+    let layer_shell = LayerShell::bind(&globals, &qh).context("the compositor lacks wlr-layer-shell")?;
     let viewporter: WpViewporter =
-        globals.bind(&qh, 1..=1, ()).context("compositor lacks wp_viewporter")?;
-    let shm = Shm::bind(&globals, &qh).context("no wl_shm")?;
+        globals.bind(&qh, 1..=1, ()).context("the compositor lacks wp_viewporter")?;
+    let shm = Shm::bind(&globals, &qh).context("the compositor lacks wl_shm")?;
+    let env = Env { compositor, subcompositor, viewporter };
+
+    let dim_a = (cfg.ui.dim * 255.0).round() as u8;
+    let solids = Solids::new(
+        &shm,
+        &[Rgb(0, 0, 0).argb(dim_a), theme.primary.argb(255), theme.surface.argb(255)],
+    )?;
 
     let mut event_loop: EventLoop<Overlay> = EventLoop::try_new()?;
-    let (tool, color, width) = (opts.tool, opts.color, opts.width);
+    let (tool, color, width) = (cfg.draw.tool, cfg.draw.color, cfg.draw.width);
     let mut app = Overlay {
         conn: conn.clone(),
         qh: qh.clone(),
         loop_handle: event_loop.handle(),
         registry: RegistryState::new(&globals),
-        compositor,
+        env,
         outputs: OutputState::new(&globals, &qh),
         seats: SeatState::new(&globals, &qh),
         shm,
+        solids,
         surfs: Vec::new(),
         shots,
-        format: wl_shm::Format::Xrgb8888,
+        cfg,
         theme,
         fonts,
         sel: opts.preset.map(|r| r.rounded()),
@@ -192,59 +222,81 @@ pub fn run(shots: Vec<Shot>, theme: Theme, fonts: Fonts, opts: Options) -> Resul
         width,
         history: History::default(),
         current: None,
+        cur_bounds: None,
         typing: false,
         hover: None,
     };
     queue.roundtrip(&mut app)?;
     queue.roundtrip(&mut app)?;
-    if app.shm.formats().contains(&wl_shm::Format::Xbgr8888) {
-        // same byte order as tiny-skia: no per-frame channel swap
-        app.format = wl_shm::Format::Xbgr8888;
-    }
 
     let wl_outputs: Vec<_> = app.outputs.outputs().collect();
     for idx in 0..app.shots.len() {
         let shot = &app.shots[idx];
         let out = wl_outputs
             .iter()
-            .find(|o| {
-                app.outputs.info(o).and_then(|i| i.name).as_deref() == Some(shot.name.as_str())
-            })
+            .find(|o| app.outputs.info(o).and_then(|i| i.name).as_deref() == Some(shot.name.as_str()))
             .with_context(|| format!("output {} vanished", shot.name))?;
-        let surface = app.compositor.create_surface(&qh);
-        let layer =
-            layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("opal"), Some(out));
+        let surface = app.env.compositor.create_surface(&qh);
+        let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("opal"), Some(out));
         layer.set_anchor(Anchor::all());
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.set_size(0, 0);
-        let viewport = viewporter.get_viewport(layer.wl_surface(), &qh, ());
+        let viewport = app.env.viewporter.get_viewport(layer.wl_surface(), &qh, ());
         viewport.set_destination(shot.lw, shot.lh);
         layer.commit();
 
-        let (pw, ph) = (shot.pixmap.width(), shot.pixmap.height());
-        let mut dim = shot.pixmap.clone();
-        dim_pixmap(&mut dim, app.opts.dim);
-        let scratch =
-            (app.format != wl_shm::Format::Xbgr8888).then(|| Pixmap::new(pw, ph)).flatten();
-        let surf = Surf {
+        let parent = layer.wl_surface().clone();
+        let quad = |c: usize| Quad::new(&app.env, &parent, app.solids.get(c), &qh);
+        let quads = |n: usize, c: usize| (0..n).map(|_| quad(c)).collect::<Vec<_>>();
+        // creation order is stacking order
+        let dim: [Quad; 4] = std::array::from_fn(|_| quad(SOLID_DIM));
+        let anno = Anno::new(&app.env, &parent, &app.shm, &qh)?;
+        let mut border = Vec::new();
+        for _ in 0..4 {
+            border.push(Panel::new(&app.env, &parent, &app.shm, &qh)?);
+        }
+        let border: [Panel; 4] = border.try_into().ok().context("border panels")?;
+        let handle_edge = quads(8, SOLID_SURFACE);
+        let handle_fill = quads(8, SOLID_PRIMARY);
+        let toolbar = Panel::new(&app.env, &parent, &app.shm, &qh)?;
+        let label = Panel::new(&app.env, &parent, &app.shm, &qh)?;
+        let hint = Panel::new(&app.env, &parent, &app.shm, &qh)?;
+        app.surfs.push(Surf {
             layer,
-            _viewport: viewport,
+            viewport,
             name: shot.name.clone(),
             shot: idx,
-            geo: Rect::new(shot.x as f32, shot.y as f32, shot.lw as f32, shot.lh as f32),
+            geo: shot.logical(),
             k: shot.scale(),
             dim,
-            scratch,
-            pool: SlotPool::new((pw * ph * 4) as usize * 2, &app.shm)?,
+            anno,
+            anno_origin: None,
+            anno_dirty: None,
+            border,
+            handle_edge,
+            handle_fill,
+            toolbar,
+            label,
+            hint,
             configured: false,
+            drawn: false,
             frame_pending: false,
             dirty: true,
-        };
-        app.surfs.push(surf);
+        });
     }
     app.bounds = app.surfs.iter().map(|s| s.geo).reduce(|a, b| a.union(&b)).unwrap_or_default();
 
+    // a second `opal` (or a signal) closes us cleanly
+    let signals = crate::sig::signal_fd(&[libc::SIGUSR1, libc::SIGTERM, libc::SIGINT])?;
+    event_loop
+        .handle()
+        .insert_source(Generic::new(signals, Interest::READ, Mode::Level), |_, fd, app: &mut Overlay| {
+            crate::sig::drain(&**fd);
+            app.outcome = Some(Outcome::Cancel);
+            Ok(PostAction::Continue)
+        })
+        .map_err(|e| anyhow::anyhow!("event loop: {e}"))?;
     // the event loop gives us timers for key repeat
     WaylandSource::new(conn.clone(), queue)
         .insert(event_loop.handle())
@@ -258,17 +310,8 @@ pub fn run(shots: Vec<Shot>, theme: Theme, fonts: Fonts, opts: Options) -> Resul
     Ok(Finished {
         outcome: app.outcome.take().unwrap(),
         shots: std::mem::take(&mut app.shots),
-        fonts: std::mem::replace(&mut app.fonts, Fonts::empty()),
+        fonts: std::mem::replace(&mut app.fonts, Fonts::new("builtin")),
     })
-}
-
-fn dim_pixmap(pm: &mut Pixmap, amount: f32) {
-    let keep = ((1.0 - amount) * 256.0) as u32;
-    for px in pm.data_mut().chunks_exact_mut(4) {
-        for c in &mut px[..3] {
-            *c = ((*c as u32 * keep) >> 8) as u8;
-        }
-    }
 }
 
 fn handle_at(sel: Rect, p: Pt) -> Option<Handle> {
@@ -300,43 +343,35 @@ fn handle_icon(h: Handle) -> CursorIcon {
     }
 }
 
-/// Letter keys by evdev code, so shortcuts work on any keyboard layout.
-fn tool_for_key(code: u32) -> Option<Tool> {
-    Some(match code {
-        30 => Tool::Arrow,       // A
-        38 => Tool::Line,        // L
-        19 => Tool::Rect,        // R
-        18 => Tool::Ellipse,     // E
-        25 => Tool::Pen,         // P
-        35 => Tool::Highlighter, // H
-        20 => Tool::Text,        // T
-        48 => Tool::Pixelate,    // B (blur)
-        49 => Tool::Step,        // N (number)
-        _ => return None,
-    })
-}
-
-const KEY_Z: u32 = 44;
-const KEY_Y: u32 = 21;
-const KEY_C: u32 = 46;
-
 fn trace(msg: impl FnOnce() -> String) {
     if std::env::var_os("OPAL_TRACE").is_some() {
         eprintln!("{}", msg());
     }
 }
 
+fn hash_of<T: Hash>(v: &T) -> u64 {
+    let mut h = DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
 impl Overlay {
     // ── state helpers ────────────────────────────────────────────────
 
     fn style(&self) -> Style {
-        Style { color: COLORS[self.color], width: self.width }
+        Style { color: self.cfg.draw.palette[self.color], width: self.width }
+    }
+
+    /// The output holding a point (half-open, so borders belong to one output only).
+    fn owner(&self, p: Pt) -> Option<usize> {
+        let p = self.bounds.clamp_pt(p);
+        self.surfs.iter().position(|s| p.x >= s.geo.x && p.x < s.geo.right() && p.y >= s.geo.y && p.y < s.geo.bottom())
     }
 
     /// The output the toolbar must stay on: the one under the selection's center.
     fn toolbar_area(&self, sel: Rect) -> Rect {
         let c = Pt::new(sel.x + sel.w / 2.0, sel.y + sel.h / 2.0);
-        self.surfs.iter().map(|s| s.geo).find(|g| g.contains(c)).unwrap_or(self.bounds)
+        self.owner(c).map_or(self.bounds, |i| self.surfs[i].geo)
     }
 
     fn toolbar(&self) -> Option<Toolbar> {
@@ -344,22 +379,18 @@ impl Overlay {
         if matches!(self.drag, Drag::New { .. } | Drag::Move { .. } | Drag::Resize { .. }) {
             return None;
         }
-        (sel.w >= 4.0 && sel.h >= 4.0).then(|| toolbar::layout(sel, self.toolbar_area(sel)))
+        (sel.w >= 4.0 && sel.h >= 4.0).then(|| {
+            ui::layout(sel, self.toolbar_area(sel), self.cfg.draw.palette.len(), &self.cfg.ui.toolbar)
+        })
     }
 
-    fn ui_region(&self, sel: Rect) -> Rect {
-        let tb = toolbar::layout(sel, self.toolbar_area(sel));
-        sel.inflate(70.0).union(&tb.rect.inflate(40.0))
-    }
-
-    fn invalidate(&mut self, region: Option<Rect>, qh: &QueueHandle<Self>) {
+    /// Redraw every output (each one only touches what changed).
+    fn schedule(&mut self, qh: &QueueHandle<Self>) {
         let mut todo = Vec::new();
         for (i, s) in self.surfs.iter_mut().enumerate() {
-            if region.is_none_or(|r| r.intersect(&s.geo).is_some()) {
-                s.dirty = true;
-                if s.configured && !s.frame_pending {
-                    todo.push(i);
-                }
+            s.dirty = true;
+            if s.configured && !s.frame_pending {
+                todo.push(i);
             }
         }
         for i in todo {
@@ -367,23 +398,12 @@ impl Overlay {
         }
     }
 
-    /// Redraw the selection and toolbar area.
-    fn refresh(&mut self, qh: &QueueHandle<Self>) {
-        let region = self.sel.map(|s| self.ui_region(s));
-        self.invalidate(region, qh);
-    }
-
     fn set_sel(&mut self, new: Option<Rect>, qh: &QueueHandle<Self>) {
-        let old = self.sel;
-        if old == new {
+        if self.sel == new {
             return;
         }
         self.sel = new;
-        let region = match (old, new) {
-            (Some(a), Some(b)) => Some(self.ui_region(a).union(&self.ui_region(b))),
-            _ => None, // hint appears/disappears: redraw everything
-        };
-        self.invalidate(region, qh);
+        self.schedule(qh);
     }
 
     fn snap(&self, p: Pt) -> Pt {
@@ -426,6 +446,22 @@ impl Overlay {
 
     // ── annotations ──────────────────────────────────────────────────
 
+    /// Remember that an area of the annotation layer must be redrawn.
+    fn mark_anno(&mut self, r: Rect) {
+        for s in &mut self.surfs {
+            s.anno_dirty = Some(s.anno_dirty.map_or(r, |d| d.union(&r)));
+        }
+    }
+
+    /// `current` changed: redraw where it was and where it is.
+    fn touch_current(&mut self) {
+        let now = self.current.as_ref().map(Item::rough_bounds);
+        let old = std::mem::replace(&mut self.cur_bounds, now);
+        for r in [old, now].into_iter().flatten() {
+            self.mark_anno(r);
+        }
+    }
+
     fn commit_text(&mut self) {
         self.typing = false;
         if let Some(it) = self.current.take() {
@@ -433,6 +469,7 @@ impl Overlay {
                 self.history.push(it);
             }
         }
+        self.touch_current();
     }
 
     fn start_draw(&mut self, p: Pt) {
@@ -448,16 +485,20 @@ impl Overlay {
             Tool::Text => {
                 self.current = Some(Item { kind: Kind::Text { at: p, text: String::new() }, style });
                 self.typing = true;
+                self.touch_current();
                 return;
             }
             Tool::Step => {
                 let n = self.history.next_step();
-                self.history.push(Item { kind: Kind::Step { at: p, n }, style });
+                let item = Item { kind: Kind::Step { at: p, n }, style };
+                self.mark_anno(item.rough_bounds());
+                self.history.push(item);
                 return;
             }
         };
         self.current = Some(Item { kind, style });
         self.drag = Drag::Draw;
+        self.touch_current();
     }
 
     fn extend_draw(&mut self, p: Pt) {
@@ -468,26 +509,25 @@ impl Overlay {
                     pts.push(p);
                 }
             }
-            Kind::Line(_, b)
-            | Kind::Arrow(_, b)
-            | Kind::Rect(_, b)
-            | Kind::Ellipse(_, b)
-            | Kind::Pixelate(_, b) => *b = p,
+            Kind::Line(_, b) | Kind::Arrow(_, b) | Kind::Rect(_, b) | Kind::Ellipse(_, b) | Kind::Pixelate(_, b) => *b = p,
             _ => {}
         }
+        self.touch_current();
     }
 
     fn finish_draw(&mut self) {
         let Some(it) = self.current.take() else { return };
         let keep = match &it.kind {
             Kind::Pen(_) | Kind::Highlighter(_) => true,
-            Kind::Line(a, b) | Kind::Arrow(a, b) | Kind::Rect(a, b) | Kind::Ellipse(a, b)
-            | Kind::Pixelate(a, b) => (a.x - b.x).hypot(a.y - b.y) >= 3.0,
+            Kind::Line(a, b) | Kind::Arrow(a, b) | Kind::Rect(a, b) | Kind::Ellipse(a, b) | Kind::Pixelate(a, b) => {
+                (a.x - b.x).hypot(a.y - b.y) >= 3.0
+            }
             _ => false,
         };
         if keep {
             self.history.push(it);
         }
+        self.touch_current();
     }
 
     fn do_action(&mut self, a: Action, qh: &QueueHandle<Self>) {
@@ -496,19 +536,17 @@ impl Overlay {
             Action::Color(i) => {
                 self.color = i;
                 if let Some(it) = &mut self.current {
-                    it.style.color = COLORS[i];
+                    it.style.color = self.cfg.draw.palette[i];
+                    self.touch_current();
                 }
             }
             Action::Width(i) => self.width = WIDTHS[i],
             Action::Undo => self.undo(),
-            Action::Redo => {
-                self.commit_text();
-                self.history.redo();
-            }
+            Action::Redo => self.redo(),
             Action::Cancel => self.outcome = Some(Outcome::Cancel),
             Action::Confirm => self.finish(),
         }
-        self.refresh(qh);
+        self.schedule(qh);
     }
 
     fn select_tool(&mut self, t: Tool) {
@@ -521,16 +559,23 @@ impl Overlay {
             // typing counts as the newest step: drop the unfinished text
             self.typing = false;
             self.current = None;
-        } else {
-            self.history.undo();
+            self.touch_current();
+        } else if let Some(r) = self.history.undo() {
+            self.mark_anno(r);
+        }
+    }
+
+    fn redo(&mut self) {
+        self.commit_text();
+        if let Some(r) = self.history.redo() {
+            self.mark_anno(r);
         }
     }
 
     fn finish(&mut self) {
         self.commit_text();
         if let Some(sel) = self.sel {
-            self.outcome =
-                Some(Outcome::Done { rect: sel.rounded(), items: std::mem::take(&mut self.history.items) });
+            self.outcome = Some(Outcome::Done { rect: sel.rounded(), items: std::mem::take(&mut self.history.items) });
         }
     }
 
@@ -549,7 +594,7 @@ impl Overlay {
         }
         if self.typing {
             self.commit_text();
-            self.refresh(qh);
+            self.schedule(qh);
         }
         let p = self.snap(self.cursor);
         match self.sel {
@@ -561,7 +606,7 @@ impl Overlay {
                     } else {
                         let c = self.cursor;
                         self.start_draw(c);
-                        self.refresh(qh);
+                        self.schedule(qh);
                     }
                 }
                 None => self.drag = Drag::New { anchor: p },
@@ -580,20 +625,18 @@ impl Overlay {
                 let hover = self.toolbar().and_then(|t| t.hit(self.cursor));
                 if hover != self.hover {
                     self.hover = hover;
-                    self.refresh(qh);
+                    self.schedule(qh);
                 }
                 return;
             }
             Drag::Draw => {
                 let c = self.bounds.clamp_pt(self.cursor);
                 self.extend_draw(c);
-                self.refresh(qh);
+                self.schedule(qh);
                 return;
             }
             Drag::New { anchor } => Rect::from_points(anchor, p),
-            Drag::Move { grab, orig } => {
-                orig.translate(p.x - grab.x, p.y - grab.y).fit_into(&self.bounds)
-            }
+            Drag::Move { grab, orig } => orig.translate(p.x - grab.x, p.y - grab.y).fit_into(&self.bounds),
             Drag::Resize { handle, orig } => {
                 let (mut x0, mut y0, mut x1, mut y1) = (orig.x, orig.y, orig.right(), orig.bottom());
                 match handle.dx {
@@ -617,7 +660,7 @@ impl Overlay {
         match was {
             Drag::Draw => {
                 self.finish_draw();
-                self.refresh(qh);
+                self.schedule(qh);
             }
             Drag::New { .. } | Drag::Move { .. } | Drag::Resize { .. } => {
                 if let Some(sel) = self.sel {
@@ -626,7 +669,7 @@ impl Overlay {
                     } else if matches!(was, Drag::New { .. }) && self.opts.finish_on_release {
                         self.outcome = Some(Outcome::Done { rect: sel.rounded(), items: Vec::new() });
                     } else {
-                        self.refresh(qh); // toolbar appears
+                        self.schedule(qh); // toolbar appears
                     }
                 }
             }
@@ -636,215 +679,273 @@ impl Overlay {
 
     // ── drawing ──────────────────────────────────────────────────────
 
+    /// Bring every subsurface of output `i` up to date, then commit it.
     fn draw(&mut self, qh: &QueueHandle<Self>, i: usize) {
-        let show_hint = self.sel.is_none()
-            && self.opts.hint_output.as_deref().is_none_or(|n| n == self.surfs[i].name);
+        let t0 = std::time::Instant::now();
         let tb = self.toolbar();
-        let tb_state = toolbar::State {
-            tool: self.tool,
-            color: self.color,
-            width: self.width,
-            can_undo: self.history.can_undo() || self.typing,
-            can_redo: self.history.can_redo(),
-            hover: self.hover,
-        };
-        let scene = Scene {
-            sel: self.sel,
-            show_hint,
-            canvas_scale: self.opts.canvas_scale,
-            items: &self.history.items,
-            current: self.current.as_ref(),
-            typing: self.typing,
-            toolbar: tb.as_ref().map(|t| (t, &tb_state)),
-            shots: &self.shots,
-        };
-        let format = self.format;
-        let s = &mut self.surfs[i];
-        let (w, h) = (self.shots[s.shot].pixmap.width(), self.shots[s.shot].pixmap.height());
-        let Ok((buffer, data)) = s.pool.create_buffer(w as i32, h as i32, (w * 4) as i32, format)
-        else {
-            return;
-        };
-        let target = Target { geo: s.geo, k: s.k, frozen: &self.shots[s.shot].pixmap, dim: &s.dim };
-        match s.scratch.as_mut() {
-            None => {
-                let mut pm = PixmapMut::from_bytes(data, w, h).unwrap();
-                render(&mut pm, &target, &scene, &mut self.fonts, &self.theme);
+        let sel = self.sel;
+        let typing = self.typing;
+        let border = self.cfg.ui.border as i32;
+        let (geo, k) = (self.surfs[i].geo, self.surfs[i].k);
+        let (ow, oh) = (geo.w as i32, geo.h as i32);
+        let area = IRect::new(0, 0, ow, oh);
+        let local = |r: Rect| IRect::round(Rect::new(r.x - geo.x, r.y - geo.y, r.w, r.h));
+        let px = |v: i32| (v as f32 * k).round() as i32;
+
+        // what the toolbar shows
+        let can_undo = self.history.can_undo() || typing;
+        let can_redo = self.history.can_redo();
+        let (tool, color, width, hover) = (self.tool, self.color, self.width, self.hover);
+        let tb_owner = tb.as_ref().and_then(|t| self.owner(Pt::new(t.rect.x + t.rect.w / 2.0, t.rect.y + t.rect.h / 2.0)));
+        let label_owner = sel.and_then(|s| self.owner(Pt::new(s.x, s.y)));
+        let hint_here = self.opts.hint_output.as_deref().is_none_or(|n| n == self.surfs[i].name);
+
+        let surf = &mut self.surfs[i];
+        let first = !surf.drawn;
+
+        // background: the capture itself, attached once
+        if first {
+            let shot = &self.shots[surf.shot];
+            let wl = surf.layer.wl_surface();
+            wl.attach(Some(&shot.buffer), 0, 0);
+            wl.damage_buffer(0, 0, shot.w as i32, shot.h as i32);
+            if shot.has_alpha() {
+                if let Ok(r) = Region::new(&self.env.compositor) {
+                    r.add(0, 0, ow, oh);
+                    wl.set_opaque_region(Some(r.wl_region()));
+                }
             }
-            Some(scratch) => {
-                let mut pm = scratch.as_mut();
-                render(&mut pm, &target, &scene, &mut self.fonts, &self.theme);
-                for (d, p) in data.chunks_exact_mut(4).zip(scratch.data().chunks_exact(4)) {
-                    d.copy_from_slice(&[p[2], p[1], p[0], p[3]]);
+            surf.viewport.set_destination(ow, oh);
+        }
+
+        let sel_l = sel.map(local);
+
+        // dim: everything outside the selection
+        let dims = match sel_l.and_then(|s| s.clip(area)) {
+            None => [Some(area), None, None, None],
+            Some(s) => [
+                Some(IRect::new(0, 0, ow, s.y)),
+                Some(IRect::new(0, s.bottom(), ow, oh - s.bottom())),
+                Some(IRect::new(0, s.y, s.x, s.h)),
+                Some(IRect::new(s.right(), s.y, ow - s.right(), s.h)),
+            ],
+        };
+        for (q, r) in surf.dim.iter_mut().zip(dims) {
+            q.set(r);
+        }
+
+        // border (outside the selection) and handles
+        match sel_l {
+            Some(s) => {
+                // Hyprland draws a 1px-thick subsurface 2px thick, so a 1px
+                // bar is a 2px buffer whose second pixel is transparent.
+                let t = if border == 1 { 2 } else { border };
+                let bars = [
+                    (IRect::new(s.x - border, s.y - border, s.w + 2 * border, t), true),
+                    (IRect::new(s.x - border, s.bottom(), s.w + 2 * border, t), true),
+                    (IRect::new(s.x - border, s.y, t, s.h), false),
+                    (IRect::new(s.right(), s.y, t, s.h), false),
+                ];
+                let primary = self.theme.primary.argb(255);
+                let colored = px(border);
+                for (q, (full, horizontal)) in surf.border.iter_mut().zip(bars) {
+                    let r = full.clip(area);
+                    let size = r.map_or((0, 0), |r| (px(r.w), px(r.h)));
+                    // how much of the bar's start the clip cut off, in px
+                    let skip = r.map_or(0, |r| px(if horizontal { r.y - full.y } else { r.x - full.x }));
+                    q.set(r, size, hash_of(&(size, primary, skip, colored)), |buf| {
+                        bar_pixels(buf, size, horizontal, skip, colored, primary)
+                    });
+                }
+                let big = s.w > 56 && s.h > 56;
+                let (cx, cy) = (s.x + s.w / 2, s.y + s.h / 2);
+                let mut pts = vec![(s.x, s.y), (s.right(), s.y), (s.x, s.bottom()), (s.right(), s.bottom())];
+                if big {
+                    pts.extend([(cx, s.y), (cx, s.bottom()), (s.x, cy), (s.right(), cy)]);
+                }
+                for n in 0..8 {
+                    let at = pts.get(n).copied();
+                    let r = |size: i32| at.and_then(|(x, y)| IRect::new(x - size / 2, y - size / 2, size, size).clip(area));
+                    surf.handle_edge[n].set(r(HANDLE_OUTER));
+                    surf.handle_fill[n].set(r(HANDLE_INNER));
+                }
+            }
+            None => {
+                for q in &mut surf.border {
+                    q.set(None, (0, 0), 0, |_| {});
+                }
+                for q in surf.handle_edge.iter_mut().chain(&mut surf.handle_fill) {
+                    q.set(None);
                 }
             }
         }
-        let surface = s.layer.wl_surface();
-        surface.damage_buffer(0, 0, w as i32, h as i32);
-        surface.frame(qh, FrameCallbackData(surface.clone()));
-        let _ = buffer.attach_to(surface);
-        s.layer.commit();
-        s.frame_pending = true;
-        s.dirty = false;
-    }
-}
 
-struct Scene<'a> {
-    sel: Option<Rect>,
-    show_hint: bool,
-    canvas_scale: f32,
-    items: &'a [Item],
-    current: Option<&'a Item>,
-    typing: bool,
-    toolbar: Option<(&'a Toolbar, &'a toolbar::State)>,
-    shots: &'a [Shot],
-}
-
-struct Target<'a> {
-    /// Logical rectangle of this output.
-    geo: Rect,
-    /// Physical pixels per logical pixel.
-    k: f32,
-    frozen: &'a Pixmap,
-    dim: &'a Pixmap,
-}
-
-/// Copy a physical-pixel rectangle between two same-sized pixel buffers.
-fn copy_px(dst: &mut [u8], src: &[u8], w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32) {
-    let (x0, y0, x1, y1) = (x0.max(0), y0.max(0), x1.min(w), y1.min(h));
-    if x1 <= x0 {
-        return;
-    }
-    for y in y0..y1 {
-        let a = ((y * w + x0) * 4) as usize;
-        let b = ((y * w + x1) * 4) as usize;
-        dst[a..b].copy_from_slice(&src[a..b]);
-    }
-}
-
-fn render(pm: &mut PixmapMut, t: &Target, sc: &Scene, fonts: &mut Fonts, th: &Theme) {
-    let (geo, k) = (t.geo, t.k);
-    pm.data_mut().copy_from_slice(t.dim.data());
-    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
-    // logical (global) -> physical (this buffer)
-    let to_px = |r: Rect| Rect::new((r.x - geo.x) * k, (r.y - geo.y) * k, r.w * k, r.h * k);
-
-    let Some(sel) = sc.sel else {
-        if sc.show_hint {
-            hint(pm, fonts, th, k);
-        }
-        return;
-    };
-
-    // bright selection straight from the capture
-    let sp = to_px(sel);
-    let (sx0, sy0) = (sp.x.round() as i32, sp.y.round() as i32);
-    let (sx1, sy1) = (sp.right().round() as i32, sp.bottom().round() as i32);
-    copy_px(pm.data_mut(), t.frozen.data(), pw, ph, sx0, sy0, sx1, sy1);
-
-    // annotations, then put the dimmed pixels back outside the selection
-    if !sc.items.is_empty() || sc.current.is_some() {
-        let ctx = Ctx {
-            tf: Transform::from_row(k, 0.0, 0.0, k, -geo.x * k, -geo.y * k),
-            k,
-            shots: sc.shots,
-        };
-        annot::draw_all(pm, &ctx, sc.items, fonts);
-        if let Some(cur) = sc.current {
-            annot::draw(pm, &ctx, cur, fonts);
-            if sc.typing {
-                caret(pm, &ctx, cur, fonts, th);
+        // annotations: only the selection part on this output
+        let layer = sel.and_then(|s| local(s.rounded()).clip(area));
+        let has_content = !self.history.items.is_empty() || self.current.is_some();
+        let mut anno_ok = true;
+        match layer {
+            Some(lr) if has_content => {
+                let origin = (geo.x as i32 + lr.x, geo.y as i32 + lr.y);
+                let size = (px(lr.w), px(lr.h));
+                let moved = surf.anno_origin != Some(origin);
+                let full = IRect::new(0, 0, size.0, size.1);
+                let dirty = if moved || !surf.anno.is_shown() {
+                    Some(full)
+                } else {
+                    surf.anno_dirty.map(|d| {
+                        let x0 = ((d.x - origin.0 as f32) * k).floor() as i32 - 1;
+                        let y0 = ((d.y - origin.1 as f32) * k).floor() as i32 - 1;
+                        let x1 = ((d.right() - origin.0 as f32) * k).ceil() as i32 + 1;
+                        let y1 = ((d.bottom() - origin.1 as f32) * k).ceil() as i32 + 1;
+                        IRect::new(x0, y0, x1 - x0, y1 - y0)
+                    })
+                };
+                let history = &self.history.items;
+                let current = self.current.as_ref();
+                let fonts = &mut self.fonts;
+                let shots = &self.shots;
+                let (aa, block) = (self.cfg.draw.antialias, self.cfg.draw.pixelate_block);
+                let mut render = |pm: &mut Pixmap, region: IRect| {
+                    let ctx = Ctx {
+                        tf: Transform::from_row(k, 0.0, 0.0, k, -(origin.0 as f32) * k - region.x as f32, -(origin.1 as f32) * k - region.y as f32),
+                        k,
+                        shots,
+                        aa,
+                        block,
+                    };
+                    // logical, global area this region covers
+                    let area = Rect::new(
+                        origin.0 as f32 + region.x as f32 / k,
+                        origin.1 as f32 + region.y as f32 / k,
+                        region.w as f32 / k,
+                        region.h as f32 / k,
+                    );
+                    let mut view = pm.as_mut();
+                    for it in history.iter().chain(current) {
+                        if it.rough_bounds().intersect(&area).is_some() {
+                            annot::draw(&mut view, &ctx, it, fonts);
+                        }
+                    }
+                    if typing {
+                        if let Some(it) = current {
+                            caret(&mut view, &ctx, it, fonts);
+                        }
+                    }
+                };
+                anno_ok = surf.anno.update(lr, size, dirty, &mut render);
+                if anno_ok {
+                    surf.anno_origin = Some(origin);
+                    surf.anno_dirty = None;
+                }
+            }
+            _ => {
+                surf.anno.clear();
+                surf.anno_origin = None;
+                surf.anno_dirty = None;
             }
         }
-        let d = t.dim.data();
-        let data = pm.data_mut();
-        copy_px(data, d, pw, ph, 0, 0, pw, sy0); // above
-        copy_px(data, d, pw, ph, 0, sy1, pw, ph); // below
-        copy_px(data, d, pw, ph, 0, sy0, sx0, sy1); // left
-        copy_px(data, d, pw, ph, sx1, sy0, pw, sy1); // right
-    }
 
-    draw_frame(pm, sp, k, sc.toolbar.is_some());
-    if sel.w >= 1.0 && sel.h >= 1.0 {
-        let dims = format!(
-            "{} × {}",
-            (sel.w * sc.canvas_scale).round() as i32,
-            (sel.h * sc.canvas_scale).round() as i32
-        );
-        size_label(pm, fonts, th, &dims, sp, k);
-    }
-    if let Some((tb, st)) = sc.toolbar {
-        toolbar::draw(pm, tb, st, th, k, &to_px);
+        // toolbar
+        let tb_here = tb.as_ref().filter(|_| tb_owner == Some(i));
+        match tb_here {
+            Some(t) => {
+                let r = local(t.rect);
+                let size = (px(r.w), px(r.h));
+                let key = hash_of(&(tool, color, width.to_bits(), can_undo, can_redo, hover, size, k.to_bits(), border));
+                let st = ui::State { tool, color, width, palette: &self.cfg.draw.palette, can_undo, can_redo, hover };
+                let theme = &self.theme;
+                surf.toolbar.set(Some(r), size, key, |buf| {
+                    ui::draw_toolbar(&mut Canvas::new(buf, size.0, size.1), t, &st, theme, border as f32, k);
+                });
+            }
+            None => surf.toolbar.set(None, (0, 0), 0, |_| {}),
+        }
+
+        // size label above the selection's top-left corner
+        let label_here = self.cfg.ui.size_label && label_owner == Some(i);
+        match sel.filter(|s| label_here && s.w >= 1.0 && s.h >= 1.0) {
+            Some(s) => {
+                let text = format!(
+                    "{} x {}",
+                    (s.w * self.opts.canvas_scale).round() as i32,
+                    (s.h * self.opts.canvas_scale).round() as i32
+                );
+                let (lw, lh) = ui::label_size(&text);
+                let (lw, lh) = (lw as i32, lh as i32);
+                let sl = local(s);
+                let mut y = sl.y - lh - border;
+                if y < 0 {
+                    y = sl.y + border; // no room above: tuck inside
+                }
+                let x = sl.x.clamp(0, (ow - lw).max(0));
+                let size = (px(lw), px(lh));
+                let key = hash_of(&(text.as_str(), size));
+                let theme = &self.theme;
+                surf.label.set(Some(IRect::new(x, y, lw, lh)), size, key, |buf| {
+                    ui::draw_label(&mut Canvas::new(buf, size.0, size.1), &text, theme, border as f32, k);
+                });
+            }
+            None => surf.label.set(None, (0, 0), 0, |_| {}),
+        }
+
+        // hint before the first drag
+        if sel.is_none() && self.cfg.ui.hint && hint_here {
+            let text = "drag to select \u{b7} esc to cancel";
+            let (hw, hh) = ui::label_size(text);
+            let (hw, hh) = (hw as i32 + 16, hh as i32 + 8);
+            let size = (px(hw), px(hh));
+            let key = hash_of(&(size, k.to_bits()));
+            let theme = &self.theme;
+            surf.hint.set(Some(IRect::new((ow - hw) / 2, oh - 110 - hh, hw, hh)), size, key, |buf| {
+                let mut c = Canvas::new(buf, size.0, size.1);
+                ui::frame(&mut c, theme, border as f32, k);
+                let s = (k.round() as i32).max(1);
+                c.text(px(8 + 5), px(4 + 2), text, s, theme.text.argb(255));
+            });
+        } else {
+            surf.hint.set(None, (0, 0), 0, |_| {});
+        }
+
+        let wl = surf.layer.wl_surface();
+        wl.frame(qh, FrameCallbackData(wl.clone()));
+        surf.layer.commit();
+        surf.frame_pending = true;
+        // no buffer was free for the annotations: try again next frame
+        surf.dirty = !anno_ok;
+        surf.drawn = true;
+        trace(|| format!("draw {} took {:?}", surf.name, t0.elapsed()));
     }
 }
 
-fn hint(pm: &mut PixmapMut, fonts: &mut Fonts, th: &Theme, k: f32) {
-    let (pw, ph) = (pm.width() as f32, pm.height() as f32);
-    let text = "Drag to select an area   ·   Esc to cancel";
-    let size = 14.0 * k;
-    let (tw, text_h) = fonts.measure(text, size, 500);
-    let (padx, pady) = (20.0 * k, 11.0 * k);
-    let r = Rect::new((pw - tw) / 2.0 - padx, ph - 110.0 * k, tw + 2.0 * padx, text_h + 2.0 * pady);
-    glass::panel(pm, r, r.h / 2.0, k, th);
-    fonts.draw(pm, text, r.x + padx, r.y + pady, size, 500, th.text);
+/// Fill a bar buffer: the first `colored` pixels across its thickness (counted
+/// from the uncut start, `skip` already clipped away) get `argb`, the rest stay
+/// transparent.
+fn bar_pixels(buf: &mut [u8], size: (i32, i32), horizontal: bool, skip: i32, colored: i32, argb: u32) {
+    let c = argb.to_le_bytes();
+    for (i, p) in buf.chunks_exact_mut(4).enumerate() {
+        let (x, y) = (i as i32 % size.0, i as i32 / size.0);
+        let across = if horizontal { y } else { x } + skip;
+        p.copy_from_slice(&if across < colored { c } else { [0; 4] });
+    }
 }
 
-/// Blinking-free text cursor after the last typed character.
-fn caret(pm: &mut PixmapMut, ctx: &Ctx, it: &Item, fonts: &mut Fonts, th: &Theme) {
+/// Text cursor after the last typed character.
+fn caret(pm: &mut PixmapMut, ctx: &Ctx, it: &Item, fonts: &mut Fonts) {
     let Kind::Text { at, text } = &it.kind else { return };
     let size = annot::text_size(&it.style) * ctx.k;
     let lines = text.split('\n').count();
     let last = text.rsplit('\n').next().unwrap_or("");
-    let (w, line_h) = if last.is_empty() { (0.0, (size * 1.25).round()) } else { fonts.measure(last, size, 600) };
-    let x = at.x * ctx.k + ctx.tf.tx + w + 1.0 * ctx.k;
-    let y = at.y * ctx.k + ctx.tf.ty + (lines - 1) as f32 * (size * 1.25).round();
-    if let Some(r) = tiny_skia::Rect::from_xywh(x, y + line_h * 0.08, 1.6 * ctx.k, line_h * 0.84) {
+    let lh = Fonts::line_height(size);
+    let w = if last.is_empty() { 0.0 } else { fonts.line_width(last, size) };
+    let x = at.x * ctx.tf.sx + ctx.tf.tx + w + 1.0 * ctx.k;
+    let y = at.y * ctx.tf.sy + ctx.tf.ty + (lines - 1) as f32 * lh;
+    if let Some(r) = tiny_skia::Rect::from_xywh(x, y + lh * 0.08, (1.6 * ctx.k).max(1.0).round(), lh * 0.84) {
         let mut p = Paint::default();
-        p.set_color(th.text);
+        p.set_color_rgba8(it.style.color[0], it.style.color[1], it.style.color[2], 255);
+        p.anti_alias = false;
         pm.fill_rect(r, &p, Transform::identity(), None);
     }
-}
-
-fn draw_frame(pm: &mut PixmapMut, r: Rect, k: f32, editing: bool) {
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
-    // dark under-line so the border reads on bright screenshots too
-    if let Some(rect) = tiny_skia::Rect::from_xywh(r.x, r.y, r.w, r.h) {
-        let path = PathBuilder::from_rect(rect);
-        paint.set_color(Color::from_rgba8(0, 0, 0, 70));
-        pm.stroke_path(&path, &paint, &Stroke { width: 3.0 * k, ..Default::default() }, Transform::identity(), None);
-        paint.set_color(Color::from_rgba8(255, 255, 255, if editing { 150 } else { 235 }));
-        pm.stroke_path(&path, &paint, &Stroke { width: 1.5 * k, ..Default::default() }, Transform::identity(), None);
-    }
-    // handles: corners and edge midpoints
-    let big = r.w > 56.0 * k && r.h > 56.0 * k;
-    let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
-    let mut pts = vec![(r.x, r.y), (r.right(), r.y), (r.x, r.bottom()), (r.right(), r.bottom())];
-    if big {
-        pts.extend([(cx, r.y), (cx, r.bottom()), (r.x, cy), (r.right(), cy)]);
-    }
-    for (x, y) in pts {
-        if let Some(c) = PathBuilder::from_circle(x, y, 5.0 * k) {
-            paint.set_color(Color::from_rgba8(0, 0, 0, 80));
-            pm.fill_path(&c, &paint, FillRule::Winding, Transform::from_translate(0.0, k), None);
-            paint.set_color(Color::from_rgba8(255, 255, 255, 255));
-            pm.fill_path(&c, &paint, FillRule::Winding, Transform::identity(), None);
-        }
-    }
-}
-
-fn size_label(pm: &mut PixmapMut, fonts: &mut Fonts, th: &Theme, text: &str, sel: Rect, k: f32) {
-    let size = 12.5 * k;
-    let (tw, text_h) = fonts.measure(text, size, 600);
-    let (padx, pady) = (11.0 * k, 5.0 * k);
-    let (w, h) = (tw + 2.0 * padx, text_h + 2.0 * pady);
-    let mut y = sel.y - h - 10.0 * k;
-    if y < 6.0 * k {
-        y = sel.y + 10.0 * k; // no room above: tuck inside
-    }
-    let r = Rect::new(sel.x.max(6.0 * k), y, w, h);
-    glass::panel(pm, r, h / 2.0, k, th);
-    fonts.draw(pm, text, r.x + padx, r.y + pady, size, 600, th.text);
 }
 
 // ── Wayland plumbing ─────────────────────────────────────────────────────
@@ -870,7 +971,10 @@ impl OutputHandler for Overlay {
     }
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    /// An output went away while we are open: close, the capture is stale.
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.outcome = Some(Outcome::Cancel);
+    }
 }
 
 impl LayerShellHandler for Overlay {
@@ -878,21 +982,12 @@ impl LayerShellHandler for Overlay {
         self.outcome = Some(Outcome::Cancel);
     }
 
-    fn configure(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        layer: &LayerSurface,
-        _: LayerSurfaceConfigure,
-        _: u32,
-    ) {
+    fn configure(&mut self, _: &Connection, qh: &QueueHandle<Self>, layer: &LayerSurface, _: LayerSurfaceConfigure, _: u32) {
         if let Some(i) = self.surfs.iter().position(|s| s.layer.wl_surface() == layer.wl_surface()) {
             if !self.surfs[i].configured {
                 self.surfs[i].configured = true;
                 self.draw(qh, i);
-                if std::env::var_os("OPAL_TRACE").is_some() {
-                    eprintln!("first frame on {}", self.surfs[i].name);
-                }
+                trace(|| format!("first frame on {}", self.surfs[i].name));
             }
         }
     }
@@ -910,14 +1005,11 @@ impl SeatHandler for Overlay {
                 let (conn, qh) = (st.conn.clone(), st.qh.clone());
                 st.key(&conn, &qh, e);
             });
-            self.keyboard = self
-                .seats
-                .get_keyboard_with_repeat(qh, &seat, None, self.loop_handle.clone(), repeat)
-                .ok();
+            self.keyboard = self.seats.get_keyboard_with_repeat(qh, &seat, None, self.loop_handle.clone(), repeat).ok();
         }
         if cap == Capability::Pointer && self.pointer.is_none() {
             // dedicated surface for the cursor image
-            let cursor_surface = self.compositor.create_surface(qh);
+            let cursor_surface = self.env.compositor.create_surface(qh);
             self.pointer = self
                 .seats
                 .get_pointer_with_theme::<_, ()>(qh, &seat, self.shm.wl_shm(), cursor_surface, ThemeSpec::default())
@@ -966,8 +1058,8 @@ impl KeyboardHandler for Overlay {
 impl Overlay {
     fn key(&mut self, conn: &Connection, qh: &QueueHandle<Self>, e: KeyEvent) {
         // evdev code of the physical key, so shortcuts work on any layout
-        let phys = e.raw_code; // wl_keyboard.key: already the evdev code
-        let ctrl = self.mods.ctrl;
+        let phys = e.raw_code;
+        let (ctrl, shift, alt) = (self.mods.ctrl, self.mods.shift, self.mods.alt);
         trace(|| format!("key phys={phys} sym={:?} utf8={:?} ctrl={ctrl} typing={}", e.keysym, e.utf8, self.typing));
 
         // text entry swallows plain keys
@@ -979,53 +1071,58 @@ impl Overlay {
                     if let Some(Item { kind: Kind::Text { text, .. }, .. }) = &mut self.current {
                         text.pop();
                     }
+                    self.touch_current();
                 }
                 Keysym::Return | Keysym::KP_Enter => {
                     if let Some(Item { kind: Kind::Text { text, .. }, .. }) = &mut self.current {
                         text.push('\n');
                     }
+                    self.touch_current();
                 }
                 _ => match e.utf8.as_deref() {
                     Some(s) if !s.chars().any(char::is_control) => {
                         if let Some(Item { kind: Kind::Text { text, .. }, .. }) = &mut self.current {
                             text.push_str(s);
                         }
+                        self.touch_current();
                     }
                     _ => changed = false,
                 },
             }
             if changed {
-                self.refresh(qh);
+                self.schedule(qh);
             }
             return;
         }
 
-        match e.keysym {
-            Keysym::Escape => self.outcome = Some(Outcome::Cancel),
-            Keysym::Return | Keysym::KP_Enter => self.finish(),
-            Keysym::space => {
-                self.space = true;
-                self.update_cursor(conn);
-            }
-            _ if ctrl && phys == KEY_C => self.finish(),
-            _ if ctrl && phys == KEY_Z && !self.mods.shift => {
+        if e.keysym == Keysym::space {
+            self.space = true;
+            self.update_cursor(conn);
+            return;
+        }
+        match self.cfg.keys.lookup(phys, ctrl, shift, alt) {
+            Some(Cmd::Cancel) => self.outcome = Some(Outcome::Cancel),
+            Some(Cmd::Confirm) => self.finish(),
+            Some(Cmd::Undo) => {
                 self.undo();
-                self.refresh(qh);
+                self.schedule(qh);
             }
-            _ if ctrl && (phys == KEY_Y || (phys == KEY_Z && self.mods.shift)) => {
-                self.commit_text();
-                self.history.redo();
-                self.refresh(qh);
+            Some(Cmd::Redo) => {
+                self.redo();
+                self.schedule(qh);
             }
-            _ if !ctrl && !self.mods.alt && self.sel.is_some() => {
-                if let Some(t) = tool_for_key(phys) {
-                    self.select_tool(t);
-                    self.refresh(qh);
-                } else if (2..=1 + COLORS.len() as u32).contains(&phys) {
+            Some(Cmd::Tool(t)) if self.sel.is_some() => {
+                self.select_tool(t);
+                self.schedule(qh);
+            }
+            Some(Cmd::Tool(_)) => {}
+            None => {
+                // 1-9: palette colors
+                let n = self.cfg.draw.palette.len().min(9) as u32;
+                if !ctrl && !alt && self.sel.is_some() && (2..2 + n).contains(&phys) {
                     self.do_action(Action::Color(phys as usize - 2), qh);
                 }
             }
-            _ => {}
         }
     }
 }
@@ -1059,6 +1156,7 @@ impl PointerHandler for Overlay {
                                 self.current = None;
                                 self.typing = false;
                                 self.drag = Drag::None;
+                                self.touch_current();
                                 self.set_sel(None, qh)
                             }
                             None => self.outcome = Some(Outcome::Cancel),
@@ -1081,8 +1179,9 @@ impl PointerHandler for Overlay {
                         self.width = (self.width + step).clamp(1.0, 24.0);
                         if let Some(it) = &mut self.current {
                             it.style.width = self.width;
+                            self.touch_current();
                         }
-                        self.refresh(qh);
+                        self.schedule(qh);
                     }
                 }
             }

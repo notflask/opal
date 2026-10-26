@@ -5,7 +5,7 @@
   makeWrapper,
   libxkbcommon,
   libnotify,
-  wl-clipboard,
+  fontconfig,
 }:
 
 rustPlatform.buildRustPackage {
@@ -17,6 +17,8 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [
       ../Cargo.toml
       ../Cargo.lock
+      ../build.rs
+      ../assets
       ../src
       ../examples
     ];
@@ -33,13 +35,13 @@ rustPlatform.buildRustPackage {
   cargoBuildFlags = [ "--bins" ];
   doCheck = false;
 
-  # notify-send for the "copied" notification
+  # notify-send for the "copied" notification, fc-match to find the text tool's font
   postInstall = ''
-    wrapProgram $out/bin/opal --prefix PATH : ${lib.makeBinPath [ libnotify ]}
+    wrapProgram $out/bin/opal --prefix PATH : ${lib.makeBinPath [ libnotify fontconfig ]}
   '';
 
   meta = {
-    description = "Screenshot tool for Wayland: region, monitor or all monitors, with annotations and a liquid-glass UI";
+    description = "Screenshot tool for Wayland: region, monitor or all monitors, with annotations, a flat pixel UI and a zoom tool";
     mainProgram = "opal";
     platforms = lib.platforms.linux;
   };

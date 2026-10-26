@@ -1,0 +1,3 @@
+[templates.opal]
+input_path  = "~/.config/matugen/templates/opal-colors.toml"
+output_path = "~/.config/opal/colors.toml"

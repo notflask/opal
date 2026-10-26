@@ -1,5 +1,5 @@
 {
-  description = "opal — screenshot tool for Wayland with a liquid-glass annotation UI";
+  description = "opal — screenshot and zoom tool for Wayland with a flat pixel UI";
 
   inputs.nixpkgs.url = "nixpkgs";
 
