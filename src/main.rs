@@ -31,8 +31,6 @@ USAGE: opal <command>
   output [--no-edit]   the focused monitor
   all [--no-edit]      every monitor, stitched into one image
   zoom                 freeze the screen, zoom and pan it (wheel, drag, F flashlight)
-  zoom --live [in|out|reset]
-                       Hyprland only: zoom the live screen
   config               print the default config.toml
   config --check [F]   check F (default: your config.toml), exit 1 on problems
 

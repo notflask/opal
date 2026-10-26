@@ -462,3 +462,6 @@ Built as planned, with these differences:
 - **`config --check`** names the key of a problem, not the line number.
 - **Not done:** pixel snapping of the border on fractional scales (no such monitor here),
   the `[keys]` table does not cover the zoom keys.
+- **`opal zoom --live` was removed again** (the Hyprland `cursor:zoom_factor` mode). Hyprland pans
+  that zoom with the pointer only: no drag, no flashlight, no way for Opal to know where the
+  pointer is in the zoomed picture. Only the frozen `opal zoom` remains.

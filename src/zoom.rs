@@ -6,8 +6,6 @@
 //! rendered by the CPU instead, for crisp pixels. The flashlight is a hole
 //! buffer plus four dim bars, moved with the pointer.
 //!
-//! Live mode (Hyprland only): the compositor zooms the real screen
-//! (`cursor:zoom_factor`); we only catch the wheel and keys.
 
 use std::time::Instant;
 
@@ -262,12 +260,6 @@ enum Exit {
     Save,
 }
 
-enum Mode {
-    Frozen,
-    /// Hyprland zooms; this is the zoom factor to restore.
-    Live { orig: f32 },
-}
-
 /// The flashlight hole: a subsurface cropped to the output.
 struct Hole {
     s: Sub,
@@ -319,7 +311,6 @@ struct Zoomer {
     surfs: Vec<ZSurf>,
     shots: Vec<Shot>,
     cfg: Config,
-    mode: Mode,
     view: View,
 
     pointer: Option<ThemedPointer>,
@@ -338,43 +329,23 @@ struct Zoomer {
 }
 
 pub fn run(args: &[&str], cfg: Config) -> Result<()> {
-    let mut live = false;
-    let mut one_shot = None;
-    for a in args {
-        match *a {
-            "--live" => live = true,
-            "in" | "out" | "reset" if live => one_shot = Some(*a),
-            other => bail!("usage: opal zoom [--live [in|out|reset]] (got {other:?})"),
-        }
-    }
-    if live {
-        if !ipc::is_hyprland() {
-            bail!("live zoom needs Hyprland (cursor:zoom_factor)");
-        }
-        if let Some(cmd) = one_shot {
-            return live_step(&cfg.zoom, cmd);
-        }
+    if let Some(a) = args.first() {
+        bail!("usage: opal zoom (got {a:?})");
     }
     let Some(_guard) = crate::lock::acquire() else { return Ok(()) };
     let conn = Connection::connect_to_env().context("no Wayland compositor")?;
 
-    let mut shots = Vec::new();
-    let mode = if live {
-        Mode::Live { orig: hypr_zoom().unwrap_or(1.0) }
-    } else {
-        let want = ipc::pointer_output();
-        shots = match want.as_deref().map(|n| capture::capture(&conn, Some(n))) {
-            Some(Ok(s)) => s,
-            _ => {
-                let mut all = capture::capture(&conn, None)?;
-                all.truncate(1);
-                all
-            }
-        };
-        Mode::Frozen
+    let want = ipc::pointer_output();
+    let shots = match want.as_deref().map(|n| capture::capture(&conn, Some(n))) {
+        Some(Ok(s)) => s,
+        _ => {
+            let mut all = capture::capture(&conn, None)?;
+            all.truncate(1);
+            all
+        }
     };
     let trace = std::env::var_os("OPAL_TRACE").is_some();
-    let exit = run_app(&conn, shots, cfg.clone(), mode, trace)?;
+    let exit = run_app(&conn, shots, cfg.clone(), trace)?;
     if let Some((shot, view, nearest, exit)) = exit {
         let img = render_view(&shot, view, nearest)?;
         let png = output::encode_png(&img)?;
@@ -389,35 +360,9 @@ pub fn run(args: &[&str], cfg: Config) -> Result<()> {
     Ok(())
 }
 
-fn hypr_zoom() -> Option<f32> {
-    let v: serde_json::Value = serde_json::from_str(&ipc::hypr("j/getoption cursor:zoom_factor")?).ok()?;
-    v["float"].as_f64().map(|f| f as f32)
-}
-
-/// Set Hyprland's zoom: the Lua `eval` first (Hyprland 0.55+ with a Lua
-/// config), the classic `keyword` otherwise.
-fn set_hypr_zoom(z: f32) -> bool {
-    let ok = |r: Option<String>| r.is_some_and(|r| r.trim().eq_ignore_ascii_case("ok") || r.trim().is_empty());
-    ok(ipc::hypr(&format!("/eval hl.config({{cursor={{zoom_factor={z}}}}})")))
-        || ok(ipc::hypr(&format!("/keyword cursor:zoom_factor {z}")))
-}
-
-fn live_step(z: &ZoomCfg, cmd: &str) -> Result<()> {
-    let cur = hypr_zoom().context("cannot read cursor:zoom_factor from Hyprland")?;
-    let next = match cmd {
-        "in" => (cur + z.live_step).min(z.max),
-        "out" => (cur - z.live_step).max(1.0),
-        _ => 1.0,
-    };
-    if !set_hypr_zoom(next) {
-        bail!("Hyprland refused cursor:zoom_factor");
-    }
-    Ok(())
-}
-
 type ViewResult = Option<(Shot, (f32, f32, f32, f32), bool, Exit)>;
 
-fn run_app(conn: &Connection, shots: Vec<Shot>, cfg: Config, mode: Mode, trace: bool) -> Result<ViewResult> {
+fn run_app(conn: &Connection, shots: Vec<Shot>, cfg: Config, trace: bool) -> Result<ViewResult> {
     let (globals, mut queue) = registry_queue_init(conn)?;
     let qh = queue.handle();
     let compositor = CompositorState::bind(&globals, &qh).context("the compositor lacks wl_compositor")?;
@@ -428,7 +373,7 @@ fn run_app(conn: &Connection, shots: Vec<Shot>, cfg: Config, mode: Mode, trace: 
     let shm = Shm::bind(&globals, &qh).context("the compositor lacks wl_shm")?;
     let env = Env { compositor, subcompositor, viewporter };
     let dim_a = (cfg.zoom.flashlight_dim * 255.0).round() as u8;
-    // 0: flashlight dim, 1: fully transparent (live mode input surface)
+    // 0: flashlight dim, 1: fully transparent (the parent surface that takes input)
     let solids = Solids::new(&shm, &[u32::from(dim_a) << 24, 0])?;
 
     let mut event_loop: EventLoop<Zoomer> = EventLoop::try_new()?;
@@ -448,7 +393,6 @@ fn run_app(conn: &Connection, shots: Vec<Shot>, cfg: Config, mode: Mode, trace: 
         flashlight: cfg.zoom.flashlight,
         radius: cfg.zoom.flashlight_radius,
         cfg,
-        mode,
         pointer: None,
         keyboard: None,
         mods: Modifiers::default(),
@@ -473,7 +417,7 @@ fn run_app(conn: &Connection, shots: Vec<Shot>, cfg: Config, mode: Mode, trace: 
         let (lw, lh) = info.logical_size.unwrap_or((0, 0));
         let (x, y) = info.logical_position.unwrap_or(info.location);
         let shot = app.shots.iter().position(|s| s.name == name);
-        if matches!(app.mode, Mode::Frozen) && shot.is_none() {
+        if shot.is_none() {
             continue;
         }
         let k = shot.map_or(info.scale_factor as f32, |i| app.shots[i].scale());
@@ -557,8 +501,8 @@ fn run_app(conn: &Connection, shots: Vec<Shot>, cfg: Config, mode: Mode, trace: 
 
     // what to hand back, taken before the surfaces go away
     let exit = app.exit.unwrap();
-    let result = match (&app.mode, exit) {
-        (Mode::Frozen, Exit::Copy | Exit::Save) if !app.shots.is_empty() => {
+    let result = match exit {
+        Exit::Copy | Exit::Save if !app.shots.is_empty() => {
             let k = app.shots[0].scale();
             let (x, y, w, h) = app.view.source();
             let shot = app.shots.remove(0);
@@ -566,9 +510,6 @@ fn run_app(conn: &Connection, shots: Vec<Shot>, cfg: Config, mode: Mode, trace: 
         }
         _ => None,
     };
-    if let Mode::Live { orig } = app.mode {
-        set_hypr_zoom(orig);
-    }
     app.surfs.clear();
     let _ = conn.roundtrip();
     if trace {
@@ -580,10 +521,6 @@ fn run_app(conn: &Connection, shots: Vec<Shot>, cfg: Config, mode: Mode, trace: 
 impl Zoomer {
     fn nearest_active(&self) -> bool {
         self.cfg.zoom.nearest && self.view.scale >= self.cfg.zoom.nearest_from
-    }
-
-    fn live(&self) -> bool {
-        matches!(self.mode, Mode::Live { .. })
     }
 
     /// Ask every output for a new frame (at most one in flight each).
@@ -759,12 +696,6 @@ impl Zoomer {
         let ctrl = self.mods.ctrl;
         match e.raw_code {
             KEY_ESC | KEY_Q => self.exit = Some(Exit::Quit),
-            _ if self.live() => match e.raw_code {
-                KEY_0 => self.live_set(1.0),
-                KEY_EQUAL => self.live_wheel(1.0),
-                KEY_MINUS => self.live_wheel(-1.0),
-                _ => {}
-            },
             KEY_0 => {
                 self.view.reset();
                 self.schedule(qh);
@@ -793,17 +724,6 @@ impl Zoomer {
             self.view.notch(dir, self.cursor);
         }
         self.schedule(qh);
-    }
-
-    fn live_wheel(&mut self, dir: f32) {
-        if let Some(cur) = hypr_zoom() {
-            let z = &self.cfg.zoom;
-            self.live_set((cur + dir * z.live_step).clamp(1.0, z.max));
-        }
-    }
-
-    fn live_set(&mut self, z: f32) {
-        set_hypr_zoom(z);
     }
 }
 
@@ -918,7 +838,7 @@ impl PointerHandler for Zoomer {
                     self.schedule(qh);
                 }
                 PointerEventKind::Motion { .. } => {
-                    if self.dragging && !self.live() {
+                    if self.dragging {
                         let (dx, dy) = (pos.0 - self.cursor.0, pos.1 - self.cursor.1);
                         self.view.pan(dx, dy);
                         let now = Instant::now();
@@ -931,12 +851,10 @@ impl PointerHandler for Zoomer {
                         self.drag_last = Some((pos.0, pos.1, now));
                     }
                     self.cursor = pos;
-                    if !self.live() {
-                        self.schedule(qh);
-                    }
+                    self.schedule(qh);
                 }
                 PointerEventKind::Press { button, .. } => match button {
-                    BTN_LEFT if !self.live() => {
+                    BTN_LEFT => {
                         self.cursor = pos;
                         self.view.stop();
                         self.dragging = true;
@@ -968,11 +886,7 @@ impl PointerHandler for Zoomer {
                         (vertical.absolute / 10.0) as f32
                     };
                     if notches != 0.0 {
-                        if self.live() {
-                            self.live_wheel(-notches.signum());
-                        } else {
-                            self.wheel(-notches, qh);
-                        }
+                        self.wheel(-notches, qh);
                     }
                 }
                 PointerEventKind::Leave { .. } => {}
