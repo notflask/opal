@@ -1,115 +1,173 @@
-//! Colors for the glass UI. They come from the same matugen files the
-//! Quickshell taskbar reads, so Opal follows wallpaper and light/dark mode.
+//! Colors for the UI: eight tokens named like matugen's Material colors.
+//! Later layers win: built-in, quickshell's `colors.css`, `theme.file`,
+//! then the `[theme]` overrides in config.toml.
 
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{collections::HashMap, fs, path::Path};
 
-use tiny_skia::Color;
+use crate::config::{ThemeCfg, config_dir, expand};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+impl Rgb {
+    /// `0xAARRGGBB`, which is wl_shm Argb8888 on little-endian.
+    pub fn argb(self, a: u8) -> u32 {
+        let p = |c: u8| (c as u32 * a as u32 + 127) / 255;
+        (a as u32) << 24 | p(self.0) << 16 | p(self.1) << 8 | p(self.2)
+    }
+
+    pub fn parse(s: &str) -> Option<Rgb> {
+        let hex = s.trim().strip_prefix('#')?;
+        // #rrggbb, or #rrggbbaa (alpha is ignored: tokens are opaque)
+        if hex.len() != 6 && hex.len() != 8 {
+            return None;
+        }
+        let n = u32::from_str_radix(&hex[..6], 16).ok()?;
+        Some(Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
+    }
+
+    /// `a` blended towards `b` by `t` (0 = a, 1 = b).
+    pub fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+        let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+        Rgb(m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
+    }
+}
+
+pub const TOKENS: [&str; 8] = [
+    "surface",
+    "on_surface",
+    "on_surface_variant",
+    "outline",
+    "surface_container_high",
+    "primary",
+    "on_primary",
+    "error",
+];
 
 #[derive(Clone, Debug)]
 pub struct Theme {
-    pub glass: Color,
-    pub rim: Color,
-    pub shine: Color,
-    pub shine_low: Color,
-    pub hover: Color,
-    pub hover_strong: Color,
-    pub shadow: Color,
-    pub text: Color,
-    pub text_dim: Color,
-    pub primary: Color,
-    pub error: Color,
-    pub dark: bool,
-}
-
-fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
-    Color::from_rgba8(r, g, b, (a * 255.0).round() as u8)
+    /// panel fill
+    pub surface: Rgb,
+    /// text, active icons
+    pub text: Rgb,
+    /// inactive icons
+    pub text_dim: Rgb,
+    /// panel border, dividers
+    pub outline: Rgb,
+    /// hovered button
+    pub hover: Rgb,
+    /// selection border, handles, active tool
+    pub primary: Rgb,
+    /// icon on an active tool
+    pub on_primary: Rgb,
+    pub error: Rgb,
 }
 
 impl Default for Theme {
     fn default() -> Self {
+        // the mono desktop style
         Self {
-            glass: rgba(18, 18, 24, 0.55),
-            rim: rgba(255, 255, 255, 0.14),
-            shine: rgba(255, 255, 255, 0.22),
-            shine_low: rgba(255, 255, 255, 0.04),
-            hover: rgba(255, 255, 255, 0.08),
-            hover_strong: rgba(255, 255, 255, 0.13),
-            shadow: rgba(0, 0, 0, 0.35),
-            text: Color::from_rgba8(0xe8, 0xe1, 0xdd, 255),
-            text_dim: Color::from_rgba8(0xcc, 0xc5, 0xc2, 255),
-            primary: Color::from_rgba8(0xda, 0xc2, 0xac, 255),
-            error: Color::from_rgba8(0xff, 0xb4, 0xab, 255),
-            dark: true,
+            surface: Rgb(0x13, 0x13, 0x13),
+            text: Rgb(0xe2, 0xe2, 0xe2),
+            text_dim: Rgb(0xc6, 0xc6, 0xc6),
+            outline: Rgb(0x91, 0x91, 0x91),
+            hover: Rgb(0x2a, 0x2a, 0x2a),
+            primary: Rgb(0xff, 0xff, 0xff),
+            on_primary: Rgb(0x1b, 0x1b, 0x1b),
+            error: Rgb(0xff, 0xb4, 0xab),
         }
     }
 }
 
 impl Theme {
-    pub fn load() -> Self {
-        let mut t = Self::default();
-        let dir = config_dir().join("quickshell/taskbar");
-        let mut vars = HashMap::new();
-        for file in ["colors.css", "glass.css"] {
-            if let Ok(text) = fs::read_to_string(dir.join(file)) {
+    pub fn load(cfg: &ThemeCfg) -> Self {
+        let mut vars: HashMap<String, Rgb> = HashMap::new();
+        let mut layer = |path: &Path| -> bool {
+            let Ok(text) = fs::read_to_string(path) else { return false };
+            if path.extension().is_some_and(|e| e == "css") {
                 parse_css(&text, &mut vars);
+            } else {
+                parse_toml(&text, &mut vars);
+            }
+            true
+        };
+        layer(&config_dir().join("quickshell/taskbar/colors.css"));
+        if let Some(f) = &cfg.file {
+            layer(&expand(f));
+        }
+        for (k, v) in &cfg.tokens {
+            if let Some(c) = Rgb::parse(v) {
+                vars.insert(k.clone(), c);
             }
         }
-        let get = |name: &str, slot: &mut Color| {
+        Self::from_vars(&vars)
+    }
+
+    pub fn from_vars(vars: &HashMap<String, Rgb>) -> Self {
+        let mut t = Self::default();
+        let get = |name: &str, slot: &mut Rgb| {
             if let Some(c) = vars.get(name) {
                 *slot = *c;
             }
         };
-        get("glass", &mut t.glass);
-        get("glass_rim", &mut t.rim);
-        get("glass_shine", &mut t.shine);
-        get("glass_shine_low", &mut t.shine_low);
-        get("glass_hover", &mut t.hover);
-        get("glass_hover_strong", &mut t.hover_strong);
-        get("glass_shadow", &mut t.shadow);
+        get("surface", &mut t.surface);
         get("on_surface", &mut t.text);
         get("on_surface_variant", &mut t.text_dim);
+        get("outline", &mut t.outline);
+        get("surface_container_high", &mut t.hover);
         get("primary", &mut t.primary);
+        get("on_primary", &mut t.on_primary);
         get("error", &mut t.error);
-        // dark glass has a dark tint, light glass a bright one
-        let g = t.glass;
-        t.dark = (g.red() + g.green() + g.blue()) / 3.0 < 0.5;
         t
     }
 }
 
-pub fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// `@define-color name value;` lines, value is `#rrggbb` or `rgba(r, g, b, a)`.
-fn parse_css(text: &str, out: &mut HashMap<String, Color>) {
+/// `@define-color name value;` lines. Values other than `#hex` are skipped.
+pub fn parse_css(text: &str, out: &mut HashMap<String, Rgb>) {
     for stmt in text.split(';') {
         let Some(pos) = stmt.find("@define-color") else { continue };
         let mut parts = stmt[pos + "@define-color".len()..].trim().splitn(2, char::is_whitespace);
         let (Some(name), Some(value)) = (parts.next(), parts.next()) else { continue };
-        if let Some(c) = parse_color(value.trim()) {
+        if let Some(c) = Rgb::parse(value) {
             out.insert(name.to_owned(), c);
         }
     }
 }
 
-fn parse_color(v: &str) -> Option<Color> {
-    if let Some(hex) = v.strip_prefix('#') {
-        let n = u32::from_str_radix(hex, 16).ok()?;
-        return match hex.len() {
-            6 => Some(Color::from_rgba8((n >> 16) as u8, (n >> 8) as u8, n as u8, 255)),
-            8 => Some(Color::from_rgba8((n >> 16) as u8, (n >> 8) as u8, n as u8, (n >> 24) as u8)),
-            _ => None,
-        };
+/// Flat `name = "#rrggbb"` pairs (what the matugen template writes).
+pub fn parse_toml(text: &str, out: &mut HashMap<String, Rgb>) {
+    let Ok(t) = text.parse::<toml::Table>() else { return };
+    for (k, v) in t {
+        if let Some(c) = v.as_str().and_then(Rgb::parse) {
+            out.insert(k, c);
+        }
     }
-    let inner = v.strip_prefix("rgba(").or_else(|| v.strip_prefix("rgb("))?.strip_suffix(')')?;
-    let nums: Vec<f32> = inner.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-    match nums[..] {
-        [r, g, b] => Some(rgba(r as u8, g as u8, b as u8, 1.0)),
-        [r, g, b, a] => Some(rgba(r as u8, g as u8, b as u8, a)),
-        _ => None,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn css_and_toml_agree() {
+        let mut a = HashMap::new();
+        parse_css("@define-color primary #aabbcc;\n@define-color on_primary #112233;", &mut a);
+        let mut b = HashMap::new();
+        parse_toml("primary = \"#aabbcc\"\non_primary = \"#112233\"", &mut b);
+        assert_eq!(a, b);
+        assert_eq!(Theme::from_vars(&a).primary, Rgb(0xaa, 0xbb, 0xcc));
+    }
+
+    #[test]
+    fn hex_forms() {
+        assert_eq!(Rgb::parse("#ffffff26"), Some(Rgb(255, 255, 255)));
+        assert_eq!(Rgb::parse("fff"), None);
+        assert_eq!(Rgb::parse("#fff"), None);
+    }
+
+    #[test]
+    fn premultiplied() {
+        assert_eq!(Rgb(255, 255, 255).argb(255), 0xffff_ffff);
+        assert_eq!(Rgb(255, 0, 0).argb(128), 0x8080_0000);
     }
 }

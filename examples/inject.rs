@@ -4,7 +4,8 @@
 //!
 //! Commands: `m X Y` (absolute, compositor space), `down`/`up` (left button),
 //! `rdown`/`rup`, `tap KEY`, `kdown KEY`, `kup KEY` (evdev codes),
-//! `mods N` (xkb modifier mask, ctrl=4 shift=1 alt=8), `sleep MS`.
+//! `mods N` (xkb modifier mask, ctrl=4 shift=1 alt=8), `scroll N` (wheel notches,
+//! negative = up), `sleep MS`.
 
 use std::{
     fs::File,
@@ -109,6 +110,14 @@ fn main() {
                 let btn = if p[0].starts_with('r') { 0x111 } else { 0x110 };
                 let st = if p[0].ends_with("down") { 1 } else { 0 };
                 ptr.button(now(), btn, if st == 1 { wayland_client::protocol::wl_pointer::ButtonState::Pressed } else { wayland_client::protocol::wl_pointer::ButtonState::Released });
+                ptr.frame();
+            }
+            // mouse wheel: N notches, negative = up
+            ["scroll", n] => {
+                use wayland_client::protocol::wl_pointer::{Axis, AxisSource};
+                let n: i32 = n.parse().unwrap();
+                ptr.axis_source(AxisSource::Wheel);
+                ptr.axis_discrete(now(), Axis::VerticalScroll, f64::from(n) * 15.0, n);
                 ptr.frame();
             }
             ["tap", k] => {
